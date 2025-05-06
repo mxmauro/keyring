@@ -1,0 +1,6 @@
+github.com/deneonet/benc v1.1.7 h1:0XPxTTVJZq/ulxXvMn2Mzjx5XquekVky3wX6eTgA0vA=
+github.com/deneonet/benc v1.1.7/go.mod h1:UCfkM5Od0B2huwv/ZItvtUb7QnALFt9YXtX8NXX4Lts=
+github.com/mxmauro/shamir v1.0.1 h1:m/lcxXrnM0IySMFs1F7fZ9naMmsMyeimpkcHWgY8Cp8=
+github.com/mxmauro/shamir v1.0.1/go.mod h1:Tfo8tdA7OJtn4PleYJNZLIemFjmhJ+HO8GUCZiapAbA=
+golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa h1:FRnLl4eNAQl8hwxVVC17teOw8kdjVDVAiFMtgUdTSRQ=
+golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa/go.mod h1:zk2irFbV9DP96SEBUUAy67IdHUaZuSnrz1n472HUCLE=
