@@ -16,8 +16,11 @@ const (
 // -----------------------------------------------------------------------------
 
 type keyringParameters struct {
-	shares    uint8
-	threshold uint8
+	uniqueID        uint64
+	revision        uint32 // This field is incremented on every change.
+	usingAutoUnlock bool
+	shares          uint8
+	threshold       uint8
 }
 
 // -----------------------------------------------------------------------------
@@ -38,6 +41,18 @@ func deserializeKeyringParameters(buf []byte) (keyringParameters, error) {
 	}
 	switch version {
 	case 1:
+		ofs, kp.uniqueID, err = bstd.UnmarshalUint64(ofs, buf)
+		if err != nil {
+			return keyringParameters{}, ErrInvalidStoredData
+		}
+		ofs, kp.revision, err = bstd.UnmarshalUint32(ofs, buf)
+		if err != nil {
+			return keyringParameters{}, ErrInvalidStoredData
+		}
+		ofs, kp.usingAutoUnlock, err = bstd.UnmarshalBool(ofs, buf)
+		if err != nil {
+			return keyringParameters{}, ErrInvalidStoredData
+		}
 		ofs, kp.shares, err = bstd.UnmarshalByte(ofs, buf)
 		if err != nil {
 			return keyringParameters{}, ErrInvalidStoredData
@@ -83,10 +98,18 @@ func deserializeKeyringParametersFromStorage(ctx context.Context, tx StorageTx, 
 }
 
 func (kp *keyringParameters) Serialize() []byte {
-	bufSize := bstd.SizeUint16() + bstd.SizeByte() + bstd.SizeByte()
+	bufSize := bstd.SizeUint16() +
+		bstd.SizeUint64() +
+		bstd.SizeUint32() +
+		bstd.SizeBool() +
+		bstd.SizeByte() +
+		bstd.SizeByte()
 	buf := make([]byte, bufSize)
 
 	ofs := bstd.MarshalUint16(0, buf, keyringParametersVersion)
+	ofs = bstd.MarshalUint64(ofs, buf, kp.uniqueID)
+	ofs = bstd.MarshalUint32(ofs, buf, kp.revision)
+	ofs = bstd.MarshalBool(ofs, buf, kp.usingAutoUnlock)
 	ofs = bstd.MarshalByte(ofs, buf, kp.shares)
 	ofs = bstd.MarshalByte(ofs, buf, kp.threshold)
 

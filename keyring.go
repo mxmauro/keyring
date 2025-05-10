@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -26,64 +27,108 @@ const (
 type Keyring struct {
 	rg         io.Reader
 	beginStgTx BeginStorageTransactionFunc
-	autoUnlock AutoUnlock
 
 	mtx sync.RWMutex
 
-	params     keyringParameters
-	unlockKeys [][]byte
+	params keyringParameters
+
+	unlockInProgress struct {
+		keys   [][]byte
+		params keyringParameters
+	}
 
 	rootKey               *keyringKey
 	encryptionKeys        keyringKeyMap
 	activeEncryptionKeyID uint32
 }
 
-// Options configure the Keyring parameters.
+// Options configure the keyring base options.
 type Options struct {
 	// A transactional-enabled storage that holds keyring data.
 	BeginStorageTX BeginStorageTransactionFunc
 
 	// An optional random number generator reader. If nil, the keyring will use crypto/rand.Reader.
 	RandomGeneratorReader io.Reader
-
-	// AutoUnlock, if defined, points to an interface that implements the keyring auto unlock feature.
-	AutoUnlock AutoUnlock
-
-	// Encryption engine to use when the auto-unlock feature is enabled and the storage will be initialized.
-	AutoUnlockRootKeyEngine string
 }
 
-// AutoUnlock defines the keyring auto unlock feature interface.
-type AutoUnlock interface {
-	// Encrypt function is called when the keyring manager needs to encrypt the root key using the
-	// external secure encryption engine like AWS CloudHSM or Azure Dedicated HSM.
-	Encrypt(ctx context.Context, plaintext []byte) ([]byte, error)
+// InitializeOptions is a set of options to use to initialize the keyring.
+type InitializeOptions struct {
+	// Encryption engine to use for the initial encryption key.
+	Engine string
 
-	// Decrypt function is called when the keyring manager needs to automatically decrypt the root key.
-	Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
+	// Encryption engine to use for the root key. If not defined, the same engine for encryption keys will be used.
+	RootKeyEngine string
+
+	ManualLock *ManualLockOptions
+	AutoLock   *AutoLockOptions
+}
+
+// ManualLockOptions defines the keyring manual-lock feature options.
+type ManualLockOptions struct {
+	// Threshold defines the minimum number of keys required to unlock the keyring.
+	Threshold int
+
+	// Shares is the number of splits the root key will have.
+	Shares int
+}
+
+// AutoLockOptions defines the keyring auto-lock feature options.
+type AutoLockOptions struct {
+	// Encrypt function to call when the keyring manager needs to encrypt the root key using the
+	// external secure encryption engine like AWS CloudHSM or Azure Dedicated HSM.
+	Encrypt func(ctx context.Context, plaintext []byte) ([]byte, error)
+}
+
+// InitializeResult is returned as a result of the keyring initialization process.
+type InitializeResult struct {
+	ManualLock ManualLockResult
+}
+
+// ManualLockResult contains the result of a manual-lock keyring.
+type ManualLockResult struct {
+	// SplitRootKey will hold the split shamir root key.
+	SplitRootKey [][]byte
+}
+
+// UnlockOptions is a set of options used to unlock the keyring.
+type UnlockOptions struct {
+	ManualUnlock *ManualUnlockOptions
+	AutoUnlock   *AutoUnlockOptions
+}
+
+// ManualUnlockOptions establishes the options to use when manual-locking is used.
+type ManualUnlockOptions struct {
+	// One of the split keys to unlock the keyring.
+	Key []byte
+}
+
+// AutoUnlockOptions establishes the options to use when the auto-locking feature is used.
+type AutoUnlockOptions struct {
+	// Function to call when the keyring manager needs to decrypt the root key.
+	Decrypt func(ctx context.Context, ciphertext []byte) ([]byte, error)
+}
+
+// RotateRootKeyOptions is a set of options to use to rotate the root key of the keyring.
+type RotateRootKeyOptions struct {
+	// Encryption engine to use for the root key.
+	Engine string
+
+	ManualLock *ManualLockOptions
+	AutoLock   *AutoLockOptions
+}
+
+// RotateRootKeyResult is returned as a result of the root key rotation process.
+type RotateRootKeyResult struct {
+	ManualLock ManualLockResult
 }
 
 // -----------------------------------------------------------------------------
 
-// New creates a new keyring manager. If the keyring parameters are stored in the storage, it will
-// be initialized according.
-func New(ctx context.Context, opts Options) (*Keyring, error) {
-	var rootKey *keyringKey
-	var rootKeyNonce []byte
-	var encryptedRootKeyHashToCheck []byte
-	var encryptedRootKey []byte
-	var decryptedRootKey []byte
-	var encryptionKeys keyringKeyMap
-	var activeEncryptionKeyID uint32
-
+// New creates a new keyring manager.
+func New(opts Options) (*Keyring, error) {
 	rg := opts.RandomGeneratorReader
 	if rg == nil {
 		rg = rand.Reader
-	}
-
-	// Verify if the engine is supported if the auto-unlock feature is used.
-	if opts.AutoUnlock != nil && (!ciphers.IsEngineSupported(opts.AutoUnlockRootKeyEngine)) {
-		return nil, ciphers.ErrEngineNotSupported
 	}
 
 	// Verify if storage is valid.
@@ -91,204 +136,12 @@ func New(ctx context.Context, opts Options) (*Keyring, error) {
 		return nil, errors.New("invalid storage transaction initiator")
 	}
 
-	// Zero-ize on exit.
-	defer func() {
-		util.SafeZeroMem(encryptedRootKey)
-		util.SafeZeroMem(decryptedRootKey)
-		util.SafeZeroMem(encryptedRootKeyHashToCheck)
-		util.SafeZeroMem(rootKeyNonce)
-		if rootKey != nil {
-			rootKey.Zeroize()
-		}
-		if encryptionKeys != nil {
-			for keyID := range encryptionKeys {
-				encryptionKeys[keyID].Zeroize()
-			}
-		}
-	}()
-
 	// Create a new keyring.
 	kr := Keyring{
 		rg:             rg,
 		beginStgTx:     opts.BeginStorageTX,
-		autoUnlock:     opts.AutoUnlock,
 		encryptionKeys: make(keyringKeyMap),
 	}
-
-	// Check if the keyring parameters are stored in the database. Also, check if the root key
-	// is stored if the auto-unlock feature is enabled.
-	params := keyringParameters{}
-	paramsFound := false
-	err := kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err error) {
-		params, err = deserializeKeyringParametersFromStorage(ctx, tx, pathSystemParameters)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				// If system parameters are not stored, keep this keyring uninitialized.
-				err = nil
-			}
-			return
-		}
-		paramsFound = true
-
-		// Verify stored parameters.
-		if kr.autoUnlock == nil {
-			if params.shares < 1 || params.threshold < 1 || params.threshold > params.shares {
-				err = ErrInvalidStoredData
-				return
-			}
-		} else {
-			if params.shares != 0 || params.threshold != 0 {
-				err = ErrInvalidStoredData
-				return
-			}
-		}
-
-		// If the auto-unlock feature is enabled, load the encrypted root key.
-		if kr.autoUnlock != nil {
-			// Load the encrypted root key.
-			encryptedRootKey, err = getNonNullValue(ctx, tx, pathSystemRootKey)
-			if err != nil {
-				return
-			}
-
-			// Load the encrypted root key's hash.
-			encryptedRootKeyHashToCheck, err = getNonNullValue(ctx, tx, pathSystemRootKeyHash)
-			if err != nil {
-				return
-			}
-
-			// Load the root key nonce.
-			rootKeyNonce, err = getNonNullValue(ctx, tx, pathSystemRootKeyNonce)
-			if err != nil {
-				return
-			}
-		}
-
-		// Done
-		return
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// If parameters were not found, set up a default.
-	if !paramsFound {
-		params = keyringParameters{}
-	}
-
-	// Execute some actions if the auto-unlock feature is enabled.
-	if kr.autoUnlock != nil {
-		if !paramsFound {
-			// The keyring is not initialized, so let's try to (auto) initialize it with the auto-unlock feature.
-
-			// Create a new root key.
-			rootKey, err = generateKeyringKey(opts.AutoUnlockRootKeyEngine, kr.rg)
-			if err != nil {
-				return nil, err
-			}
-
-			// Encrypt it with the auto-lock interface.
-			encryptedRootKey, err = kr.autoUnlock.Encrypt(ctx, rootKey.Serialize())
-			if err != nil {
-				return nil, err
-			}
-
-			// Create the root key nonce.
-			rootKeyNonce, err = kr.generateNonce(rootKeyNonceSize)
-			if err != nil {
-				return nil, err
-			}
-
-			// Create an encrypted hash of the root key using the previously generated nonce.
-			encryptedRootKeyHashToCheck, err = rootKey.EncryptedHash(rootKeyNonce)
-			if err != nil {
-				return nil, err
-			}
-
-			// Save into the database.
-			err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) (err error) {
-				// Check if already initialized (race condition).
-				err = isKeyringInitialized(ctx, tx)
-				if err != nil {
-					return
-				}
-
-				// Store the keyring parameters.
-				err = params.SerializeToStorage(ctx, tx, pathSystemParameters)
-				if err != nil {
-					return
-				}
-
-				// Store the encrypted root key.
-				err = tx.Put(ctx, pathSystemRootKey, encryptedRootKey)
-				if err != nil {
-					return
-				}
-
-				// Store the encrypted root key's hash.
-				err = tx.Put(ctx, pathSystemRootKeyHash, encryptedRootKeyHashToCheck)
-				if err != nil {
-					return
-				}
-
-				// Store the root key's nonce.
-				err = tx.Put(ctx, pathSystemRootKeyNonce, rootKeyNonce)
-				if err != nil {
-					return
-				}
-
-				// Done
-				return
-			})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			var validationSucceeded bool
-
-			// Parameters are present so, first, decrypt a root key with the external auto-unlock handler.
-			decryptedRootKey, err = kr.autoUnlock.Decrypt(ctx, encryptedRootKey)
-			if err != nil {
-				return nil, err
-			}
-			rootKey, err = deserializeKeyringKey(decryptedRootKey, kr.rg)
-			if err != nil {
-				return nil, err
-			}
-
-			// Create a hash of the root key plus nonce and encrypt it using the same key.
-			validationSucceeded, err = rootKey.ValidateEncryptedHash(encryptedRootKeyHashToCheck, rootKeyNonce)
-			if err != nil {
-				return nil, err
-			}
-			if !validationSucceeded {
-				return nil, errors.New("the external auto-unlocker returned a wrong key")
-			}
-
-			// At this point we have a valid root key!!
-
-			// Read the available encryption keys.
-			err = kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err error) {
-				encryptionKeys, activeEncryptionKeyID, err = kr.readEncryptionKeys(ctx, tx, rootKey)
-				return
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// Set up the keys.
-		kr.rootKey = rootKey
-		rootKey = nil
-		if encryptionKeys != nil {
-			kr.encryptionKeys = encryptionKeys
-			encryptionKeys = nil
-		}
-		kr.activeEncryptionKeyID = activeEncryptionKeyID
-	}
-
-	// We have the parameters.
-	kr.params = params
 
 	// Done
 	return &kr, nil
@@ -304,37 +157,94 @@ func (kr *Keyring) Destroy() {
 	kr.doLock()
 }
 
-// Initialize initializes an uninitialized keyring if the auto-unlock feature is not enabled and returns
-// the split shamir root key.
-func (kr *Keyring) Initialize(ctx context.Context, engine string, shares int, threshold int) (splitRootKey [][]byte, err error) {
+// Status returns the current status of the keyring. It can be used to check if the keyring is initialized, unlocked
+// or if another instance using the same database changed any keyring configuration.
+//
+// ErrLocked is returned if the keyring is locked.
+//
+// ErrKeyringDataHasChanged is returned if an encryption key was added or the root key or a parameter was changed.
+func (kr *Keyring) Status(ctx context.Context) error {
+	kr.mtx.RLock()
+	defer kr.mtx.RUnlock()
+
+	// Check if the keyring is already unlocked.
+	if !kr.isUnlocked() {
+		return ErrLocked
+	}
+
+	// Check in the database if there was any change.
+	err := kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err2 error) {
+		err2 = isStorageInitialized(ctx, tx, &kr.params.uniqueID, &kr.params.revision)
+		return
+	})
+
+	// Done
+	return err
+}
+
+// Initialize initializes an uninitialized keyring.
+// NOTE: If initialization succeeds, the keyring remains unlocked.
+func (kr *Keyring) Initialize(ctx context.Context, opts InitializeOptions) (InitializeResult, error) {
 	var rootKey *keyringKey
+	var encryptedRootKey []byte
 	var rootKeyNonce []byte
 	var encryptedRootKeyHash []byte
-
-	// Check if the auto-unlock feature is disabled.
-	if kr.autoUnlock != nil {
-		return nil, ErrCannotUnlockIfAutoUnlockIsEnabled
-	}
+	var encryptionKeys keyringKeyMap
+	var activeEncryptionKeyID uint32
+	var err error
 
 	// Check if the engine is supported.
-	if !ciphers.IsEngineSupported(engine) {
-		return nil, ciphers.ErrEngineNotSupported
+	if !ciphers.IsEngineSupported(opts.Engine) {
+		return InitializeResult{}, ciphers.ErrEngineNotSupported
+	}
+	if len(opts.RootKeyEngine) > 0 {
+		if !ciphers.IsEngineSupported(opts.RootKeyEngine) {
+			return InitializeResult{}, ciphers.ErrEngineNotSupported
+		}
+	} else {
+		opts.RootKeyEngine = opts.Engine
 	}
 
-	// Verify key split parameters.
-	if shares < 1 || shares > 255 || threshold < 1 || threshold > shares {
-		return nil, errors.New("invalid shares or threshold parameter")
+	// Check lock options.
+	if opts.ManualLock != nil {
+		if opts.AutoLock != nil {
+			return InitializeResult{}, errors.New("use either ManualLock or AutoLock, not both")
+		}
+
+		// Verify key split parameters.
+		if opts.ManualLock.Shares < 1 || opts.ManualLock.Shares > 255 {
+			return InitializeResult{}, errors.New("invalid shares parameter")
+		}
+		if opts.ManualLock.Threshold < 1 || opts.ManualLock.Threshold > opts.ManualLock.Shares {
+			return InitializeResult{}, errors.New("invalid threshold parameter")
+		}
+	} else if opts.AutoLock != nil {
+		// Verify if the encrypt function is specified.
+		if opts.AutoLock.Encrypt == nil {
+			return InitializeResult{}, errors.New("auto-lock encrypt function is nil")
+		}
+	} else {
+		return InitializeResult{}, errors.New("neither ManualLock nor AutoLock was specified")
 	}
+
+	// Initialize result data.
+	ret := InitializeResult{}
 
 	// Zero-ize on exit.
 	defer func() {
+		util.SafeZeroMem(encryptedRootKey)
 		util.SafeZeroMem(encryptedRootKeyHash)
 		util.SafeZeroMem(rootKeyNonce)
 		if rootKey != nil {
 			rootKey.Zeroize()
 		}
+		if encryptionKeys != nil {
+			for keyID := range encryptionKeys {
+				encryptionKeys[keyID].Zeroize()
+			}
+		}
 		if err != nil {
-			util.SafeZeroMemArray(splitRootKey)
+			util.SafeZeroMemArray(ret.ManualLock.SplitRootKey)
 		}
 	}()
 
@@ -342,150 +252,170 @@ func (kr *Keyring) Initialize(ctx context.Context, engine string, shares int, th
 	kr.mtx.Lock()
 	defer kr.mtx.Unlock()
 
-	// Check if the keyring is already initialized.
-	if kr.params.shares != 0 {
-		return nil, ErrAlreadyInitialized
+	// Quick check if the keyring is already initialized.
+	if kr.isUnlocked() {
+		return InitializeResult{}, ErrAlreadyInitialized
 	}
 
 	// Generate a new root key.
-	rootKey, err = generateKeyringKey(engine, kr.rg)
+	rootKey, err = generateKeyringKey(opts.RootKeyEngine, kr.rg)
 	if err != nil {
-		return nil, err
+		return InitializeResult{}, err
 	}
 
-	// Split it.
-	splitRootKey, err = splitKeyringKey(rootKey, shares, threshold)
-	if err != nil {
-		return nil, err
+	// Split or encrypt the root key.
+	if opts.ManualLock != nil {
+		// Split it.
+		ret.ManualLock.SplitRootKey, err = rootKey.Split(opts.ManualLock.Shares, opts.ManualLock.Threshold)
+		if err != nil {
+			return InitializeResult{}, err
+		}
+	} else {
+		// Encrypt it.
+		encryptedRootKey, err = opts.AutoLock.Encrypt(ctx, rootKey.Serialize())
+		if err != nil {
+			return InitializeResult{}, err
+		}
 	}
 
 	// Create a root key nonce.
 	rootKeyNonce, err = kr.generateNonce(rootKeyNonceSize)
 	if err != nil {
-		return nil, err
+		return InitializeResult{}, err
 	}
 
 	// Create a hash of the root key plus nonce and encrypt it using the same key.
 	encryptedRootKeyHash, err = rootKey.EncryptedHash(rootKeyNonce)
 	if err != nil {
-		return nil, err
+		return InitializeResult{}, err
+	}
+
+	// Generate a new encryption key.
+	encryptionKeys = make(keyringKeyMap)
+	activeEncryptionKeyID, err = encryptionKeys.generateAndAddNewEncryptionKey(ctx, opts.Engine, kr.rg, rootKey.ID)
+	if err != nil {
+		return InitializeResult{}, err
+	}
+
+	// Set up the keyring parameters.
+	params := keyringParameters{}
+	params.uniqueID, err = kr.generateRandomUint64()
+	if err != nil {
+		return InitializeResult{}, err
+	}
+	params.revision = 1
+	if opts.ManualLock != nil {
+		params.shares = uint8(opts.ManualLock.Shares)
+		params.threshold = uint8(opts.ManualLock.Threshold)
+	} else {
+		params.usingAutoUnlock = true
 	}
 
 	// Save into the database.
-	params := keyringParameters{
-		shares:    uint8(shares),
-		threshold: uint8(threshold),
-	}
-	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) (err error) {
+	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) error {
 		// Check if the storage still contains an uninitialized keyring.
-		err = isKeyringInitialized(ctx, tx)
-		if err != nil {
-			return
+		err2 := isStorageInitialized(ctx, tx, nil, nil)
+		if err2 == nil {
+			return ErrAlreadyInitialized
+		}
+		if !errors.Is(err2, ErrNotFound) {
+			return err2
 		}
 
 		// Store the keyring parameters.
-		err = params.SerializeToStorage(ctx, tx, pathSystemParameters)
-		if err != nil {
-			return
+		err2 = params.SerializeToStorage(ctx, tx, pathKeyringParameters)
+		if err2 != nil {
+			return err2
 		}
 
-		// Delete the encrypted root key. (It should not exist but....)
-		err = tx.Delete(ctx, pathSystemRootKey)
-		if err != nil {
-			return
+		if opts.ManualLock != nil {
+			// Delete the encrypted root key. (It should not exist but....)
+			err2 = tx.Delete(ctx, pathKeyringRootKey)
+		} else {
+			// Store the encrypted root key.
+			err2 = tx.Put(ctx, pathKeyringRootKey, encryptedRootKey)
+		}
+		if err2 != nil {
+			return err2
 		}
 
 		// Store the encrypted root key's hash.
-		err = tx.Put(ctx, pathSystemRootKeyHash, encryptedRootKeyHash)
-		if err != nil {
-			return
+		err2 = tx.Put(ctx, pathKeyringRootKeyHash, encryptedRootKeyHash)
+		if err2 != nil {
+			return err2
 		}
 
 		// Store the root key's nonce.
-		err = tx.Put(ctx, pathSystemRootKeyNonce, rootKeyNonce)
-		if err != nil {
-			return
+		err2 = tx.Put(ctx, pathKeyringRootKeyNonce, rootKeyNonce)
+		if err2 != nil {
+			return err2
 		}
 
+		// Save the new encryption key.
+		err2 = kr.writeEncryptionKeys(ctx, tx, rootKey, encryptionKeys, activeEncryptionKeyID)
+
 		// Done
-		return
+		return err2
 	})
 	if err != nil {
-		return nil, err
+		return InitializeResult{}, err
 	}
 
-	// Store (replace) parameters and mark the keyring as initialized.
+	// Store the keyring parameters and mark the keyring as initialized.
 	kr.params = params
 
-	// Done.
-	return splitRootKey, nil
-}
+	// Set up the root key.
+	kr.rootKey = rootKey
+	rootKey = nil
 
-// InitUnlock initiates the unlock procedure.
-func (kr *Keyring) InitUnlock() error {
-	// Check if the auto-unlock feature is disabled.
-	if kr.autoUnlock != nil {
-		return ErrCannotUnlockIfAutoUnlockIsEnabled
-	}
-
-	// Lock access.
-	kr.mtx.Lock()
-	defer kr.mtx.Unlock()
-
-	// Check if the keyring is initialized.
-	if kr.params.shares == 0 {
-		return ErrNotInitialized
-	}
-
-	// Check if the keyring is already locked.
-	if kr.rootKey != nil {
-		return ErrAlreadyUnlocked
-	}
-
-	// (Re)start the keyring unlock process.
-	util.SafeZeroMemArray(kr.unlockKeys)
-	kr.unlockKeys = make([][]byte, 0)
+	// Set up the encryption keys.
+	kr.encryptionKeys = encryptionKeys
+	encryptionKeys = nil
+	kr.activeEncryptionKeyID = activeEncryptionKeyID
 
 	// Done
-	return nil
-}
-
-// CancelUnlock cancels an active keyring unlock process.
-func (kr *Keyring) CancelUnlock() {
-	if kr.autoUnlock == nil {
-		// Lock access.
-		kr.mtx.Lock()
-		defer kr.mtx.Unlock()
-
-		//Stop the keyring unlock process.
-		util.SafeZeroMemArray(kr.unlockKeys)
-		kr.unlockKeys = nil
-	}
+	return ret, nil
 }
 
 // Unlock tries to unlock the root key.
-func (kr *Keyring) Unlock(ctx context.Context, key []byte) (bool, error) {
+func (kr *Keyring) Unlock(ctx context.Context, opts UnlockOptions) error {
 	var rootKey *keyringKey
 	var rootKeyNonce []byte
 	var mergedKey []byte
 	var encryptedRootKeyHashToCheck []byte
+	var encryptedRootKey []byte
+	var decryptedRootKey []byte
+	var encryptedEncryptionKeys [][]byte
 	var encryptionKeys keyringKeyMap
 	var activeEncryptionKeyID uint32
 	var validationSucceeded bool
+	var err error
 
-	// Check if the auto-unlock feature is disabled.
-	if kr.autoUnlock != nil {
-		return false, ErrCannotUnlockIfAutoUnlockIsEnabled
-	}
+	// Check unlock options.
+	if opts.ManualUnlock != nil {
+		if opts.AutoUnlock != nil {
+			return errors.New("use either ManualUnlock or AutoUnlock, not both")
+		}
 
-	// Validate parameters.
-	if len(key) == 0 {
-		return false, errors.New("invalid key")
+		// Verify key parameter.
+		if len(opts.ManualUnlock.Key) == 0 {
+			return errors.New("invalid key parameter")
+		}
+	} else if opts.AutoUnlock != nil {
+		// Verify if the encrypt function is specified.
+		if opts.AutoUnlock.Decrypt == nil {
+			return errors.New("auto-unlock decrypt function is nil")
+		}
+	} else {
+		return errors.New("neither ManualUnlock nor AutoUnlock was specified")
 	}
 
 	// Zero-ize on exit.
 	defer func() {
+		util.SafeZeroMem(encryptedRootKey)
+		util.SafeZeroMem(decryptedRootKey)
 		util.SafeZeroMem(encryptedRootKeyHashToCheck)
+		util.SafeZeroMemArray(encryptedEncryptionKeys)
 		util.SafeZeroMem(mergedKey)
 		util.SafeZeroMem(rootKeyNonce)
 		if rootKey != nil {
@@ -496,86 +426,171 @@ func (kr *Keyring) Unlock(ctx context.Context, key []byte) (bool, error) {
 				encryptionKeys[keyID].Zeroize()
 			}
 		}
-		util.SafeZeroMemArray(kr.unlockKeys)
 	}()
 
 	// Lock access.
 	kr.mtx.Lock()
 	defer kr.mtx.Unlock()
 
-	// Check if the keyring is initialized.
-	if kr.unlockKeys == nil {
-		return false, errors.New("unlock process has not been initialized")
+	// Except we need more keys, cancel the unlocking process on exit.
+	resetUnlockInProgress := true
+	defer func() {
+		if resetUnlockInProgress {
+			kr.doCancelUnlock()
+		}
+	}()
+
+	// Check if the keyring is already unlocked.
+	if kr.isUnlocked() {
+		return ErrAlreadyUnlocked
 	}
 
-	// Add the given key to the keyring unlock list.
-	kr.unlockKeys = append(kr.unlockKeys, key)
-
-	// Check if we have enough keys.
-	if len(kr.unlockKeys) < int(uint(kr.params.threshold)) {
-		return false, nil
-	}
-
-	// Load the root key parameters from the database.
-	err := kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err error) {
-		// Load the encrypted root key's hash.
-		encryptedRootKeyHashToCheck, err = getNonNullValue(ctx, tx, pathSystemRootKeyHash)
-		if err != nil {
+	// Set up unlock in-progress details.
+	if kr.unlockInProgress.keys == nil {
+		err = kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err2 error) {
+			kr.unlockInProgress.params, err2 = deserializeKeyringParametersFromStorage(ctx, tx, pathKeyringParameters)
 			return
+		})
+		if err != nil {
+			// If the keyring parameters are not found, it means that the keyring is not initialized.
+			if errors.Is(err, ErrNotFound) {
+				return ErrNotInitialized
+			}
+			return err
+		}
+
+		// Initialize the key array.
+		kr.unlockInProgress.keys = make([][]byte, 0)
+	}
+
+	// Check if the proper unlock method is used.
+	if !kr.unlockInProgress.params.usingAutoUnlock {
+		if opts.ManualUnlock == nil {
+			return errors.New("this keyring uses manual locking")
+		}
+	} else {
+		if opts.AutoUnlock == nil {
+			return errors.New("this keyring uses auto locking")
+		}
+	}
+
+	// If using manual unlock, check if the unlocking procedure was already started.
+	if !kr.unlockInProgress.params.usingAutoUnlock {
+		// Add the given key to the keyring unlock list.
+		kr.unlockInProgress.keys = append(kr.unlockInProgress.keys, opts.ManualUnlock.Key)
+
+		// Check if we have enough keys.
+		if len(kr.unlockInProgress.keys) < int(uint(kr.unlockInProgress.params.threshold)) {
+			resetUnlockInProgress = false
+			return ErrMoreKeysRequired
+		}
+
+		// Combine the keys.
+		mergedKey, err = shamir.Combine(kr.unlockInProgress.keys)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Load the root key, parameters and other things from the database.
+	err = kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) error {
+		// Check if the storage still contains the same parameters.
+		err2 := isStorageInitialized(ctx, tx, &kr.unlockInProgress.params.uniqueID, &kr.unlockInProgress.params.revision)
+		if err2 != nil {
+			return err2
+		}
+
+		// Load the encrypted root key if executing the auto-unlock process.
+		if opts.AutoUnlock != nil {
+			encryptedRootKey, err2 = getNonNullValue(ctx, tx, pathKeyringRootKey)
+			if err2 != nil {
+				return err2
+			}
+		}
+
+		// Load the encrypted root key's hash.
+		encryptedRootKeyHashToCheck, err2 = getNonNullValue(ctx, tx, pathKeyringRootKeyHash)
+		if err2 != nil {
+			return err2
 		}
 
 		// Load the root key nonce.
-		rootKeyNonce, err = getNonNullValue(ctx, tx, pathSystemRootKeyNonce)
-		if err != nil {
-			return
+		rootKeyNonce, err2 = getNonNullValue(ctx, tx, pathKeyringRootKeyNonce)
+		if err2 != nil {
+			return err2
 		}
 
+		// Load the stored encryption keys.
+		encryptedEncryptionKeys, activeEncryptionKeyID, err2 = kr.readEncryptionKeys(ctx, tx)
+
 		// Done
-		return
+		return err2
 	})
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	// Join keys and recreate the key.
-	mergedKey, err = shamir.Combine(kr.unlockKeys)
-	if err != nil {
-		return false, err
-	}
-	rootKey, err = deserializeKeyringKey(mergedKey, kr.rg)
-	if err != nil {
-		return false, err
+	// Recreate the root key.
+	if !kr.unlockInProgress.params.usingAutoUnlock {
+		rootKey, err = deserializeKeyringKey(mergedKey, kr.rg)
+		if err != nil {
+			return err
+		}
+	} else {
+		decryptedRootKey, err = opts.AutoUnlock.Decrypt(ctx, encryptedRootKey)
+		if err != nil {
+			return err
+		}
+		rootKey, err = deserializeKeyringKey(decryptedRootKey, kr.rg)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Create a hash of the root key plus nonce and encrypt it using the same key.
+	// Validate the root key by creating a hash of the root key plus nonce and encrypt it using the same key.
 	validationSucceeded, err = rootKey.ValidateEncryptedHash(encryptedRootKeyHashToCheck, rootKeyNonce)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if !validationSucceeded {
-		return false, errors.New("one or more unlock keys are wrong")
+		return ErrUnlockFailed
 	}
 
 	// At this point we have a valid root key!!
 
-	// Read the available encryption keys.
-	err = kr.withinTx(ctx, true, func(ctx context.Context, tx StorageTx) (err error) {
-		encryptionKeys, activeEncryptionKeyID, err = kr.readEncryptionKeys(ctx, tx, rootKey)
-		return
-	})
+	// Decrypt the encryption keys and validate the active one.
+	encryptionKeys, err = kr.decryptEncryptionKeys(encryptedEncryptionKeys, rootKey)
 	if err != nil {
-		return false, err
+		return err
+	}
+	if _, ok := encryptionKeys[activeEncryptionKeyID]; !ok {
+		return fmt.Errorf("active encription key with ID 0x%X not found", activeEncryptionKeyID)
 	}
 
-	// Set up the keys.
+	// Store parameters and mark the keyring as initialized.
+	kr.params = kr.unlockInProgress.params
+
+	// Set up the root key.
 	kr.rootKey = rootKey
 	rootKey = nil
+
+	// Add the first encryption key to the map and set as current.
 	kr.encryptionKeys = encryptionKeys
-	encryptionKeys = nil
 	kr.activeEncryptionKeyID = activeEncryptionKeyID
+	encryptionKeys = nil
 
 	// Done
-	return true, nil
+	return nil
+}
+
+// CancelUnlock cancels an active keyring unlock process.
+func (kr *Keyring) CancelUnlock() {
+	// Lock access.
+	kr.mtx.Lock()
+	defer kr.mtx.Unlock()
+
+	//Stop the keyring unlock process.
+	kr.doCancelUnlock()
 }
 
 // Lock locks access until unlocked again.
@@ -592,60 +607,74 @@ func (kr *Keyring) Lock() {
 }
 
 func (kr *Keyring) doLock() {
-	util.SafeZeroMemArray(kr.unlockKeys)
-	kr.unlockKeys = nil
+	kr.unlockInProgress.params = keyringParameters{}
+	util.SafeZeroMemArray(kr.unlockInProgress.keys)
+	kr.unlockInProgress.keys = nil
 
 	if kr.rootKey != nil {
 		kr.rootKey.Zeroize()
 		kr.rootKey = nil
 	}
 
-	for idx := range kr.encryptionKeys {
-		kr.encryptionKeys[idx].Zeroize()
+	for keyID := range kr.encryptionKeys {
+		kr.encryptionKeys[keyID].Zeroize()
 	}
 	kr.encryptionKeys = make(keyringKeyMap)
 	kr.activeEncryptionKeyID = 0
+
+	kr.params = keyringParameters{}
+}
+
+func (kr *Keyring) doCancelUnlock() {
+	kr.unlockInProgress.params = keyringParameters{}
+	util.SafeZeroMemArray(kr.unlockInProgress.keys)
+	kr.unlockInProgress.keys = nil
 }
 
 // IsLocked returns if the keyring is locked or not.
 func (kr *Keyring) IsLocked() bool {
-	// Lock access
-	kr.mtx.Lock()
-	defer kr.mtx.Unlock()
+	// Lock access.
+	kr.mtx.RLock()
+	defer kr.mtx.RUnlock()
 
-	// Return lock status
-	return kr.rootKey == nil
+	// Return lock state.
+	return !kr.isUnlocked()
 }
 
-// RotateRootKey changes the root key. If auto-unlock is disabled, it will return the new split
-// shamir set, else splitRootKey will be nil.
-func (kr *Keyring) RotateRootKey(ctx context.Context, engine string, shares int, threshold int) (splitRootKey [][]byte, err error) {
-	return kr.execRotateRootKey(ctx, engine, shares, threshold)
-}
-
-// RotateAutoUnlockRootKey changes the root key. If auto-unlock is disabled, it will return the new split
-// shamir set, else splitRootKey will be nil.
-func (kr *Keyring) RotateAutoUnlockRootKey(ctx context.Context, engine string) error {
-	_, err := kr.execRotateRootKey(ctx, engine, 0, 0)
-	return err
-}
-
-func (kr *Keyring) execRotateRootKey(ctx context.Context, engine string, shares int, threshold int) (splitRootKey [][]byte, err error) {
+// RotateRootKey changes the root key. It also allows to change from manual to auto-locking and vice versa.
+func (kr *Keyring) RotateRootKey(ctx context.Context, opts RotateRootKeyOptions) (RotateRootKeyResult, error) {
 	var newRootKey *keyringKey
 	var newRootKeyNonce []byte
 	var newEncryptedRootKey []byte
 	var newEncryptedRootKeyHash []byte
+	var err error
 
-	// Verify key split parameters.
-	if kr.autoUnlock == nil {
-		if shares < 1 || shares > 255 || threshold < 1 || threshold > shares {
-			return nil, errors.New("invalid shares or threshold parameter")
+	// Check if the engine is supported.
+	if !ciphers.IsEngineSupported(opts.Engine) {
+		return RotateRootKeyResult{}, ciphers.ErrEngineNotSupported
+	}
+
+	// Check lock options.
+	if opts.ManualLock != nil {
+		if opts.AutoLock != nil {
+			return RotateRootKeyResult{}, errors.New("use either ManualLock or AutoLock, not both")
+		}
+
+		// Verify key split parameters.
+		if opts.ManualLock.Shares < 1 || opts.ManualLock.Shares > 255 || opts.ManualLock.Threshold < 1 || opts.ManualLock.Threshold > opts.ManualLock.Shares {
+			return RotateRootKeyResult{}, errors.New("invalid shares or threshold parameter")
+		}
+	} else if opts.AutoLock != nil {
+		// Verify if the encrypt function is specified.
+		if opts.AutoLock.Encrypt == nil {
+			return RotateRootKeyResult{}, errors.New("auto-lock encrypt function is nil")
 		}
 	} else {
-		if shares != 0 || threshold != 0 {
-			return nil, errors.New("invalid shares or threshold parameter")
-		}
+		return RotateRootKeyResult{}, errors.New("invalid options")
 	}
+
+	// Initialize result data.
+	ret := RotateRootKeyResult{}
 
 	// Zero-ize on exit.
 	defer func() {
@@ -656,7 +685,7 @@ func (kr *Keyring) execRotateRootKey(ctx context.Context, engine string, shares 
 			newRootKey.Zeroize()
 		}
 		if err != nil {
-			util.SafeZeroMemArray(splitRootKey)
+			util.SafeZeroMemArray(ret.ManualLock.SplitRootKey)
 		}
 	}()
 
@@ -664,157 +693,181 @@ func (kr *Keyring) execRotateRootKey(ctx context.Context, engine string, shares 
 	kr.mtx.Lock()
 	defer kr.mtx.Unlock()
 
-	// Check if we are unlocked.
-	if kr.rootKey == nil {
-		return nil, ErrLocked
+	// Check if the keyring is already unlocked.
+	if !kr.isUnlocked() {
+		return RotateRootKeyResult{}, ErrLocked
 	}
 
 	// Generate a new root key.
 	for {
-		newRootKey, err = generateKeyringKey(engine, kr.rg)
+		newRootKey, err = generateKeyringKey(opts.Engine, kr.rg)
 		if err != nil {
-			return nil, err
+			return RotateRootKeyResult{}, err
 		}
-		if !kr.isDuplicatedKeyID(newRootKey.ID) {
+
+		if !kr.encryptionKeys.containsID(newRootKey.ID) {
 			break
+		}
+
+		newRootKey.Zeroize()
+
+		select {
+		case <-ctx.Done():
+			return RotateRootKeyResult{}, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 
-	if kr.autoUnlock == nil {
+	// Split or encrypt the new root key.
+	if opts.ManualLock != nil {
 		// Split it.
-		splitRootKey, err = splitKeyringKey(newRootKey, shares, threshold)
+		ret.ManualLock.SplitRootKey, err = newRootKey.Split(opts.ManualLock.Shares, opts.ManualLock.Threshold)
 		if err != nil {
-			return nil, err
+			return RotateRootKeyResult{}, err
 		}
 	} else {
 		// Encrypt it.
-		newEncryptedRootKey, err = kr.autoUnlock.Encrypt(ctx, newRootKey.Serialize())
+		newEncryptedRootKey, err = opts.AutoLock.Encrypt(ctx, newRootKey.Serialize())
 		if err != nil {
-			return nil, err
+			return RotateRootKeyResult{}, err
 		}
 	}
 
-	// Create a root key nonce.
+	// Create a new root key nonce.
 	newRootKeyNonce, err = kr.generateNonce(rootKeyNonceSize)
 	if err != nil {
-		return nil, err
+		return RotateRootKeyResult{}, err
 	}
 
-	// Create a hash of the root key plus nonce and encrypt it using the same key.
+	// Create a hash of the new root key plus nonce and encrypt it using the same key.
 	newEncryptedRootKeyHash, err = newRootKey.EncryptedHash(newRootKeyNonce)
 	if err != nil {
-		return nil, err
+		return RotateRootKeyResult{}, err
+	}
+
+	// Set up the new keyring parameters.
+	newParams := keyringParameters{
+		uniqueID: kr.params.uniqueID,
+		revision: kr.params.revision + 1,
+	}
+	if opts.ManualLock != nil {
+		newParams.shares = uint8(opts.ManualLock.Shares)
+		newParams.threshold = uint8(opts.ManualLock.Threshold)
+	} else {
+		newParams.usingAutoUnlock = true
 	}
 
 	// Save into the database.
-	newParams := keyringParameters{
-		shares:    uint8(shares),
-		threshold: uint8(threshold),
-	}
-	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) (err error) {
-		err = isKeyringInitialized(ctx, tx)
-		if err != nil {
-			return
+	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) error {
+		err2 := isStorageInitialized(ctx, tx, &kr.params.uniqueID, &kr.params.revision)
+		if err2 != nil {
+			return err2
 		}
 
-		// Store the new keyring parameters.
-		err = tx.Put(ctx, pathSystemParameters, newParams.Serialize())
-		if err != nil {
-			return
+		// Store the keyring parameters.
+		err2 = newParams.SerializeToStorage(ctx, tx, pathKeyringParameters)
+		if err2 != nil {
+			return err2
 		}
 
-		// Store the new encrypted root key if using the auto-unlock feature.
-		if kr.autoUnlock != nil {
-			err = tx.Put(ctx, pathSystemRootKey, newEncryptedRootKey)
-			if err != nil {
-				return
-			}
+		if opts.ManualLock != nil {
+			// Delete the encrypted root key. (It should not exist but....)
+			err2 = tx.Delete(ctx, pathKeyringRootKey)
+		} else {
+			// Store the encrypted root key.
+			err2 = tx.Put(ctx, pathKeyringRootKey, newEncryptedRootKey)
+		}
+		if err2 != nil {
+			return err2
 		}
 
-		// Store the new encrypted root key's hash.
-		err = tx.Put(ctx, pathSystemRootKeyHash, newEncryptedRootKeyHash)
-		if err != nil {
-			return
+		// Store the encrypted root key's hash.
+		err2 = tx.Put(ctx, pathKeyringRootKeyHash, newEncryptedRootKeyHash)
+		if err2 != nil {
+			return err2
 		}
 
-		// Store the new root key's nonce.
-		err = tx.Put(ctx, pathSystemRootKeyNonce, newRootKeyNonce)
-		if err != nil {
-			return
+		// Store the root key's nonce.
+		err2 = tx.Put(ctx, pathKeyringRootKeyNonce, newRootKeyNonce)
+		if err2 != nil {
+			return err2
 		}
 
 		// Save encryption keys encrypted with the new root key.
-		err = kr.writeEncryptionKeys(ctx, tx, newRootKey, kr.encryptionKeys, kr.activeEncryptionKeyID)
+		err2 = kr.writeEncryptionKeys(ctx, tx, newRootKey, kr.encryptionKeys, kr.activeEncryptionKeyID)
 
 		// Done
-		return
+		return err2
 	})
 	if err != nil {
-		return nil, err
+		return RotateRootKeyResult{}, err
 	}
 
-	// Replace the keyring parameters and current root key.
+	// Replace the keyring parameters.
 	kr.params = newParams
+
+	// Replace the root key.
 	kr.rootKey.Zeroize()
 	kr.rootKey = newRootKey
 	newRootKey = nil
 
 	// Done
-	return splitRootKey, nil
+	return ret, nil
 }
 
 // AddEncryptionKey adds a new encryption key to the keyring. Later encryption will use this new key.
 func (kr *Keyring) AddEncryptionKey(ctx context.Context, engine string) error {
-	var newEncryptionKey *keyringKey
+	var newEncryptionKeyID uint32
 	var err error
-
-	// Zero-ize on exit.
-	defer func() {
-		if newEncryptionKey != nil {
-			newEncryptionKey.Zeroize()
-		}
-	}()
 
 	// Lock access.
 	kr.mtx.Lock()
 	defer kr.mtx.Unlock()
 
-	// Check if we are unlocked.
-	if kr.rootKey == nil {
+	// Check if the keyring is already unlocked.
+	if !kr.isUnlocked() {
 		return ErrLocked
 	}
 
 	// Generate a new encryption key.
-	for {
-		newEncryptionKey, err = generateKeyringKey(engine, kr.rg)
-		if err != nil {
-			return err
-		}
-		if !kr.isDuplicatedKeyID(newEncryptionKey.ID) {
-			break
-		}
-		newEncryptionKey.Zeroize()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-
-	// Save the new encryption key.
-	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) (err error) {
-		err = kr.writeNewEncryptionKey(ctx, tx, newEncryptionKey)
-		return
-	})
+	newEncryptionKeyID, err = kr.encryptionKeys.generateAndAddNewEncryptionKey(ctx, engine, kr.rg, kr.rootKey.ID)
 	if err != nil {
 		return err
 	}
 
+	// Increment revision.
+	prevRevision := kr.params.revision
+	kr.params.revision += 1
+
+	// Save the new encryption key.
+	err = kr.withinTx(ctx, false, func(ctx context.Context, tx StorageTx) (err error) {
+		err = isStorageInitialized(ctx, tx, &kr.params.uniqueID, &prevRevision)
+		if err != nil {
+			return err
+		}
+
+		err = kr.params.SerializeToStorage(ctx, tx, pathKeyringParameters)
+		if err != nil {
+			return err
+		}
+
+		err = kr.writeNewEncryptionKey(ctx, tx, newEncryptionKeyID)
+		return
+	})
+	if err != nil {
+		// Before retuning, remove the newly created key.
+		kr.encryptionKeys[newEncryptionKeyID].Zeroize()
+		delete(kr.encryptionKeys, newEncryptionKeyID)
+
+		// And restore the revision value
+		kr.params.revision = prevRevision
+
+		// Return error.
+		return err
+	}
+
 	// Add the new key to the map and set as current.
-	kr.encryptionKeys[newEncryptionKey.ID] = newEncryptionKey
-	kr.activeEncryptionKeyID = newEncryptionKey.ID
-	newEncryptionKey = nil
+	kr.activeEncryptionKeyID = newEncryptionKeyID
 
 	// Done
 	return nil
@@ -833,15 +886,9 @@ func (kr *Keyring) Encrypt(plaintext []byte) ([]byte, error) {
 	kr.mtx.RLock()
 	defer kr.mtx.RUnlock()
 
-	// Check if we are unlocked.
-	if kr.rootKey == nil {
+	// Check if the keyring is already unlocked.
+	if !kr.isUnlocked() {
 		return nil, ErrLocked
-	}
-
-	// Get the newest encryption key.
-	keysLen := len(kr.encryptionKeys)
-	if keysLen == 0 {
-		return nil, ErrNoEncryptionKeysAvailable
 	}
 
 	// Get the cipher associated with the latest encryption key.
@@ -855,7 +902,6 @@ func (kr *Keyring) Encrypt(plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer util.SafeZeroMem(ciphertext)
 
 	// Build result.
 	ret := make([]byte, 1+4+len(ciphertext))
@@ -884,8 +930,8 @@ func (kr *Keyring) Decrypt(ciphertext []byte) ([]byte, error) {
 	kr.mtx.RLock()
 	defer kr.mtx.RUnlock()
 
-	// Check if we are unlocked.
-	if kr.rootKey == nil {
+	// Check if the keyring is already unlocked.
+	if !kr.isUnlocked() {
 		return nil, ErrLocked
 	}
 
@@ -907,53 +953,4 @@ func (kr *Keyring) Decrypt(ciphertext []byte) ([]byte, error) {
 
 	// Done
 	return plaintext, nil
-}
-
-func (kr *Keyring) isDuplicatedKeyID(id uint32) bool {
-	if id == kr.rootKey.ID {
-		return true
-	}
-	_, ok := kr.encryptionKeys[id]
-	return ok
-}
-
-func (kr *Keyring) generateNonce(size int) ([]byte, error) {
-	nonce := make([]byte, size)
-	l, err := kr.rg.Read(nonce)
-	if err != nil || l != size {
-		return nil, errors.New("unable to generate nonce")
-	}
-	return nonce, nil
-}
-
-func isKeyringInitialized(ctx context.Context, tx StorageTx) error {
-	encodedParams, err := tx.Get(ctx, pathSystemParameters)
-	if err != nil {
-		return err
-	}
-	if encodedParams != nil {
-		return ErrAlreadyInitialized
-	}
-	return nil
-}
-
-func getNonNullValue(ctx context.Context, tx StorageTx, key string) ([]byte, error) {
-	value, err := tx.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	if len(value) == 0 {
-		return nil, ErrInvalidStoredData
-	}
-	return value, nil
-}
-
-func splitKeyringKey(kk *keyringKey, shares int, threshold int) ([][]byte, error) {
-	if shares == 1 {
-		split := make([][]byte, 1)
-		split[0] = kk.Serialize()
-		return split, nil
-	}
-	// Split the key using the Shamir algorithm.
-	return shamir.Split(kk.Serialize(), shares, threshold)
 }

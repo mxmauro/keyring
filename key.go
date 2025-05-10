@@ -15,6 +15,7 @@ import (
 	"github.com/mxmauro/keyring/crypto/ciphers"
 	"github.com/mxmauro/keyring/models"
 	"github.com/mxmauro/keyring/util"
+	"github.com/mxmauro/shamir"
 )
 
 // -----------------------------------------------------------------------------
@@ -212,4 +213,41 @@ func (kk *keyringKey) ValidateEncryptedHash(encryptedHash []byte, nonce []byte) 
 		return false, nil
 	}
 	return true, nil
+}
+
+func (kk *keyringKey) Split(shares int, threshold int) ([][]byte, error) {
+	if shares == 1 {
+		split := make([][]byte, 1)
+		split[0] = kk.Serialize()
+		return split, nil
+	}
+	// Split the key using the Shamir algorithm.
+	return shamir.Split(kk.Serialize(), shares, threshold)
+}
+
+func (km *keyringKeyMap) containsID(id uint32) bool {
+	_, ok := (*km)[id]
+	return ok
+}
+
+func (km *keyringKeyMap) generateAndAddNewEncryptionKey(ctx context.Context, engine string, rg io.Reader, rootKeyID uint32) (uint32, error) {
+	for {
+		newEncryptionKey, err := generateKeyringKey(engine, rg)
+		if err != nil {
+			return 0, err
+		}
+
+		if newEncryptionKey.ID != rootKeyID && !km.containsID(newEncryptionKey.ID) {
+			(*km)[newEncryptionKey.ID] = newEncryptionKey
+			return newEncryptionKey.ID, nil
+		}
+
+		newEncryptionKey.Zeroize()
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }

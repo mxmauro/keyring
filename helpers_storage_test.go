@@ -24,11 +24,12 @@ type TestStorageTx struct {
 
 // -----------------------------------------------------------------------------
 
-func NewTestStorage() *TestStorage {
+func newTestStorage() *TestStorage {
 	return &TestStorage{
 		kv: make(map[string][]byte),
 	}
 }
+
 func (stg *TestStorage) BeginTX(_ context.Context, readOnly bool) (keyring.StorageTx, error) {
 	tx := TestStorageTx{
 		stg:       stg,

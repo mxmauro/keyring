@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/mxmauro/keyring/util"
 )
@@ -14,7 +15,7 @@ import (
 // BeginStorageTransactionFunc defines a function that creates a transaction in the underlying storage.
 type BeginStorageTransactionFunc func(ctx context.Context, readOnly bool) (StorageTx, error)
 
-// StorageTx is an interface that represent a storage transaction.
+// StorageTx is an interface that represents a storage transaction.
 type StorageTx interface {
 	// Get retrieves the value of the given key. Returns nil and no error if the key is not found.
 	// Also, the implementation must return a copy of the value if the underlying implementation
@@ -37,6 +38,11 @@ type StorageTx interface {
 
 // -----------------------------------------------------------------------------
 
+// IsKeyringKey returns true if the given key is a keyring key.
+func IsKeyringKey(key string) bool {
+	return isKeyringPath(key)
+}
+
 type withinTxCallback func(ctx context.Context, tx StorageTx) error
 
 func (kr *Keyring) withinTx(ctx context.Context, readOnly bool, cb withinTxCallback) error {
@@ -53,13 +59,57 @@ func (kr *Keyring) withinTx(ctx context.Context, readOnly bool, cb withinTxCallb
 	return err
 }
 
-func (kr *Keyring) readEncryptionKeys(ctx context.Context, tx StorageTx, masterKey *keyringKey) (keyringKeyMap, uint32, error) {
-	var encryptedKey []byte
-	var decryptedKey []byte
+func (kr *Keyring) readEncryptionKeys(ctx context.Context, tx StorageTx) ([][]byte, uint32, error) {
+	encryptedKeys := make([][]byte, 0)
 
-	cipher, err := masterKey.GetCipher()
+	// Zeroize on exit.
+	success := false
+	defer func() {
+		if !success {
+			util.SafeZeroMemArray(encryptedKeys)
+		}
+	}()
+
+	// Read keys.
+	for idx := 1; ; idx++ {
+		encryptedKey, err := tx.Get(ctx, pathKeyringEncryptionKeyPrefix+strconv.Itoa(idx))
+		if err != nil {
+			return nil, 0, err
+		}
+		if encryptedKey == nil {
+			break // Last item reached.
+		}
+
+		// Add to array
+		encryptedKeys = append(encryptedKeys, encryptedKey)
+	}
+
+	// It should exist at least one encryption key.
+	if len(encryptedKeys) == 0 {
+		return nil, 0, ErrInvalidStoredData
+	}
+
+	// Read the active encryption key ID.
+	activeKeyIdBytes, err := tx.Get(ctx, pathKeyringActiveEncryptionKeyID)
 	if err != nil {
 		return nil, 0, err
+	}
+	if len(activeKeyIdBytes) != idSize {
+		return nil, 0, errors.New("invalid active encryption key ID")
+	}
+	activeKeyID := binary.LittleEndian.Uint32(activeKeyIdBytes)
+
+	// Done.
+	success = true
+	return encryptedKeys, activeKeyID, nil
+}
+
+func (kr *Keyring) decryptEncryptionKeys(encryptedKeys [][]byte, rootKey *keyringKey) (keyringKeyMap, error) {
+	var decryptedKey []byte
+
+	cipher, err := rootKey.GetCipher()
+	if err != nil {
+		return nil, err
 	}
 
 	keys := make(keyringKeyMap)
@@ -67,7 +117,6 @@ func (kr *Keyring) readEncryptionKeys(ctx context.Context, tx StorageTx, masterK
 	// Zeroize on exit.
 	success := false
 	defer func() {
-		util.SafeZeroMem(encryptedKey)
 		util.SafeZeroMem(decryptedKey)
 		if !success {
 			for keyID := range keys {
@@ -78,64 +127,38 @@ func (kr *Keyring) readEncryptionKeys(ctx context.Context, tx StorageTx, masterK
 	}()
 
 	// Read keys.
-	for idx := 1; ; idx++ {
+	for _, encryptedKey := range encryptedKeys {
 		var kk *keyringKey
-
-		encryptedKey, err = tx.Get(ctx, fmt.Sprintf(pathSystemEncryptionKeyFmt, idx))
-		if err != nil {
-			return nil, 0, err
-		}
-		if encryptedKey == nil {
-			break // Last item reached.
-		}
 
 		decryptedKey, err = cipher.Decrypt(encryptedKey)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
 		kk, err = deserializeKeyringKey(decryptedKey, kr.rg)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
-		// Add to map.
+		// Add to the map.
 		_, ok := keys[kk.ID]
-		if kk.ID == masterKey.ID || ok {
+		if kk.ID == rootKey.ID || ok {
 			kk.Zeroize()
-			return nil, 0, fmt.Errorf("duplicated encryption key with ID 0x%X", kk.ID)
+			return nil, fmt.Errorf("duplicated encryption key with ID 0x%X", kk.ID)
 		}
 		keys[kk.ID] = kk
 	}
 
-	activeKeyID := uint32(0)
-	if len(keys) > 0 {
-		var activeKeyIdBytes []byte
-
-		activeKeyIdBytes, err = tx.Get(ctx, pathSystemActiveEncryptionKeyID)
-		if err != nil {
-			return nil, 0, err
-		}
-		if len(activeKeyIdBytes) != idSize {
-			return nil, 0, errors.New("invalid active encryption key ID")
-		}
-		activeKeyID = binary.LittleEndian.Uint32(activeKeyIdBytes)
-
-		if _, ok := keys[activeKeyID]; !ok {
-			return nil, 0, fmt.Errorf("active encription key with ID 0x%X not found", activeKeyID)
-		}
-	}
-
-	// Done.
+	// Done
 	success = true
-	return keys, activeKeyID, nil
+	return keys, nil
 }
 
-func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, masterKey *keyringKey, keys keyringKeyMap, activeKeyID uint32) error {
+func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, rootKey *keyringKey, encryptionKeys keyringKeyMap, activeKeyID uint32) error {
 	var encryptedKey []byte
 	var decryptedKey []byte
 
-	cipher, err := masterKey.GetCipher()
+	cipher, err := rootKey.GetCipher()
 	if err != nil {
 		return err
 	}
@@ -147,7 +170,8 @@ func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, master
 	}()
 
 	// Write keys.
-	for idx, key := range keys {
+	idx := 1
+	for _, key := range encryptionKeys {
 		decryptedKey = key.Serialize()
 
 		encryptedKey, err = cipher.Encrypt(decryptedKey)
@@ -155,7 +179,7 @@ func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, master
 			return err
 		}
 
-		err = tx.Put(ctx, fmt.Sprintf(pathSystemEncryptionKeyFmt, idx+1), encryptedKey)
+		err = tx.Put(ctx, pathKeyringEncryptionKeyPrefix+strconv.Itoa(idx), encryptedKey)
 		if err != nil {
 			return err
 		}
@@ -164,15 +188,15 @@ func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, master
 	}
 
 	// Delete next item if any.
-	err = tx.Delete(ctx, fmt.Sprintf(pathSystemEncryptionKeyFmt, len(keys)+1))
+	err = tx.Delete(ctx, pathKeyringEncryptionKeyPrefix+strconv.Itoa(idx))
 	if err != nil {
 		return err
 	}
 
 	// Write active key ID.
 	buf := make([]byte, idSize)
-	binary.LittleEndian.PutUint32(buf, keys[activeKeyID].ID)
-	err = tx.Put(ctx, pathSystemActiveEncryptionKeyID, buf)
+	binary.LittleEndian.PutUint32(buf, activeKeyID)
+	err = tx.Put(ctx, pathKeyringActiveEncryptionKeyID, buf)
 	if err != nil {
 		return err
 	}
@@ -181,7 +205,7 @@ func (kr *Keyring) writeEncryptionKeys(ctx context.Context, tx StorageTx, master
 	return nil
 }
 
-func (kr *Keyring) writeNewEncryptionKey(ctx context.Context, tx StorageTx, newKey *keyringKey) error {
+func (kr *Keyring) writeNewEncryptionKey(ctx context.Context, tx StorageTx, newKeyID uint32) error {
 	var encryptedKey []byte
 	var decryptedKey []byte
 
@@ -196,33 +220,51 @@ func (kr *Keyring) writeNewEncryptionKey(ctx context.Context, tx StorageTx, newK
 		util.SafeZeroMem(decryptedKey)
 	}()
 
-	// Write key.
-	decryptedKey = newKey.Serialize()
+	// Get new key info.
+	decryptedKey = kr.encryptionKeys[newKeyID].Serialize()
+	keysCount := len(kr.encryptionKeys)
 
+	// Write key.
 	encryptedKey, err = rootKeyCipher.Encrypt(decryptedKey)
 	if err != nil {
 		return err
 	}
 
-	err = tx.Put(ctx, fmt.Sprintf(pathSystemEncryptionKeyFmt, len(kr.encryptionKeys)+1), encryptedKey)
+	err = tx.Put(ctx, pathKeyringEncryptionKeyPrefix+strconv.Itoa(keysCount), encryptedKey)
 	if err != nil {
 		return err
 	}
 
 	// Delete next item if any.
-	err = tx.Delete(ctx, fmt.Sprintf(pathSystemEncryptionKeyFmt, len(kr.encryptionKeys)+2))
+	err = tx.Delete(ctx, pathKeyringEncryptionKeyPrefix+strconv.Itoa(keysCount+1))
 	if err != nil {
 		return err
 	}
 
 	// Write active key ID.
 	buf := make([]byte, idSize)
-	binary.LittleEndian.PutUint32(buf, newKey.ID)
-	err = tx.Put(ctx, pathSystemActiveEncryptionKeyID, buf)
+	binary.LittleEndian.PutUint32(buf, newKeyID)
+	err = tx.Put(ctx, pathKeyringActiveEncryptionKeyID, buf)
 	if err != nil {
 		return err
 	}
 
 	// Done.
+	return nil
+}
+
+func isStorageInitialized(ctx context.Context, tx StorageTx, uniqueID *uint64, revision *uint32) error {
+	params, err := deserializeKeyringParametersFromStorage(ctx, tx, pathKeyringParameters)
+	if err != nil {
+		if (uniqueID != nil || revision != nil) && errors.Is(err, ErrNotFound) {
+			return ErrKeyringDataHasChanged
+		}
+		return err
+	}
+	if uniqueID != nil && revision != nil {
+		if params.uniqueID != *uniqueID || params.revision != *revision {
+			return ErrKeyringDataHasChanged
+		}
+	}
 	return nil
 }
