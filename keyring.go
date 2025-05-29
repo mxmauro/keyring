@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/vault/shamir"
 	"github.com/mxmauro/keyring/crypto/ciphers"
 	"github.com/mxmauro/keyring/util"
-	"github.com/mxmauro/shamir"
 )
 
 // -----------------------------------------------------------------------------
@@ -641,7 +641,7 @@ func (kr *Keyring) IsLocked() bool {
 	return !kr.isUnlocked()
 }
 
-// RotateRootKey changes the root key. It also allows to change from manual to auto-locking and vice versa.
+// RotateRootKey changes the root key. It also allows changing from manual to auto-locking and vice versa.
 func (kr *Keyring) RotateRootKey(ctx context.Context, opts RotateRootKeyOptions) (RotateRootKeyResult, error) {
 	var newRootKey *keyringKey
 	var newRootKeyNonce []byte

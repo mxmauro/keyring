@@ -75,6 +75,9 @@ Don't hesitate to open a GitHub issue if you find any bug or want to share any i
 
 ## LICENSE
 
-Copyright © 2025 Mauro H. Leggieri
+Copyright © 2025 Mauro H. Leggieri. [MIT](/LICENSE)
 
-[MIT](/LICENSE)
+#### Dependency licenses:
+
+* [The Benc Project](https://github.com/deneonet/benc) MIT
+* [Hashicorp's Shamir library](https://github.com/hashicorp/vault/tree/main/shamir) MPL-2.0

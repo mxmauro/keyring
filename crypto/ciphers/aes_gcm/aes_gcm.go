@@ -24,6 +24,8 @@ type aesGcmCipher struct {
 	r    io.Reader
 	aead cipher.AEAD
 
+	overheadSize int
+
 	nonceSize int
 	noncePool sync.Pool
 }
@@ -40,7 +42,7 @@ func GenerateKey(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	if n != aesKeyLen {
-		return nil, errors.New("unable to generate aead key")
+		return nil, errors.New("unable to generate key")
 	}
 
 	// Done.
@@ -69,10 +71,11 @@ func NewFromKey(key []byte, r io.Reader) (models.Cipher, error) {
 
 	// Create a cipher object.
 	c := &aesGcmCipher{
-		r:         r,
-		aead:      aead,
-		nonceSize: aead.NonceSize(),
-		noncePool: sync.Pool{},
+		r:            r,
+		aead:         aead,
+		overheadSize: aead.Overhead(),
+		nonceSize:    aead.NonceSize(),
+		noncePool:    sync.Pool{},
 	}
 	c.noncePool.New = func() interface{} {
 		return make([]byte, c.nonceSize)
@@ -97,35 +100,36 @@ func (c *aesGcmCipher) Encrypt(plaintext []byte) ([]byte, error) {
 		return nil, err
 	}
 	if n != c.nonceSize {
-		return nil, errors.New("unable to generate aead nonce")
+		return nil, errors.New("unable to generate nonce")
 	}
 
-	// Encrypt the plain text.
-	ciphertext := c.aead.Seal(nil, nonce, plaintext, nil)
+	// Create the output slice and set its length to our prefixed custom data size.
+	output := make([]byte, 2+c.nonceSize, 2+c.nonceSize+len(plaintext)+c.overheadSize)
 
-	// Build the output.
-	output := make([]byte, 2+c.nonceSize+len(ciphertext))
+	// Save nonce size
 	binary.LittleEndian.PutUint16(output[:2], uint16(uint(c.nonceSize)))
 	copy(output[2:2+c.nonceSize], nonce)
-	copy(output[2+c.nonceSize:], ciphertext)
+
+	// Encrypt the plain text. The returned slice contains our custom data plus the encrypted plaintext.
+	ciphertext := c.aead.Seal(output, nonce, plaintext, nil)
 
 	// Done.
-	return output, nil
+	return ciphertext, nil
 }
 
 // Decrypt decrypts the given ciphertext using the AES-GCM cipher.
 func (c *aesGcmCipher) Decrypt(ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < 2 {
+	if len(ciphertext) <= 2+c.nonceSize {
 		return nil, errors.New("empty or invalid ciphertext")
 	}
 
 	// Get the nonce size.
 	nonceSize := int(uint(binary.LittleEndian.Uint16(ciphertext[:2])))
-	if len(ciphertext) <= 2+nonceSize {
+	if nonceSize != c.nonceSize {
 		return nil, errors.New("empty or invalid ciphertext")
 	}
 
-	// Get the nonce.
+	// Extract the nonce.
 	nonce := ciphertext[2 : 2+nonceSize]
 
 	// Strip the encrypted data.

@@ -12,10 +12,10 @@ import (
 	"time"
 
 	bstd "github.com/deneonet/benc/std"
+	"github.com/hashicorp/vault/shamir"
 	"github.com/mxmauro/keyring/crypto/ciphers"
 	"github.com/mxmauro/keyring/models"
 	"github.com/mxmauro/keyring/util"
-	"github.com/mxmauro/shamir"
 )
 
 // -----------------------------------------------------------------------------
