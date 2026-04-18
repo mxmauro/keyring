@@ -34,15 +34,12 @@ type keyringKey struct {
 	Key          []byte
 	CreationTime time.Time
 
-	rg     io.Reader
-	cipher models.Cipher
+	rg        io.Reader
+	cipher    models.Cipher
+	cipherMtx sync.Mutex
 }
 
 type keyringKeyMap map[uint32]*keyringKey
-
-// -----------------------------------------------------------------------------
-
-var getCipherMtx = sync.Mutex{}
 
 // -----------------------------------------------------------------------------
 
@@ -137,12 +134,16 @@ func deserializeKeyringKey(buf []byte, rg io.Reader) (*keyringKey, error) {
 }
 
 func (kk *keyringKey) Zeroize() {
+	kk.cipherMtx.Lock()
+	defer kk.cipherMtx.Unlock()
+
 	kk.ID = 0
 	kk.Engine = ""
 	util.SafeZeroMem(kk.Key)
 	kk.CreationTime = time.Time{}
 
 	kk.rg = nil
+	kk.cipher = nil
 }
 
 func (kk *keyringKey) Serialize() []byte {
@@ -164,17 +165,15 @@ func (kk *keyringKey) SerializeToStorage(ctx context.Context, tx StorageTx, key 
 }
 
 func (kk *keyringKey) GetCipher() (models.Cipher, error) {
-	if kk.cipher == nil {
-		getCipherMtx.Lock()
-		defer getCipherMtx.Unlock()
+	kk.cipherMtx.Lock()
+	defer kk.cipherMtx.Unlock()
 
-		if kk.cipher == nil {
-			cipher, err := ciphers.NewFromKey(kk.Engine, kk.Key, kk.rg)
-			if err != nil {
-				return nil, err
-			}
-			kk.cipher = cipher
+	if kk.cipher == nil {
+		cipher, err := ciphers.NewFromKey(kk.Engine, kk.Key, kk.rg)
+		if err != nil {
+			return nil, err
 		}
+		kk.cipher = cipher
 	}
 	return kk.cipher, nil
 }
@@ -200,6 +199,10 @@ func (kk *keyringKey) EncryptedHash(nonce []byte) ([]byte, error) {
 
 func (kk *keyringKey) ValidateEncryptedHash(encryptedHash []byte, nonce []byte) (bool, error) {
 	var decryptedHash []byte
+
+	defer func() {
+		util.SafeZeroMem(decryptedHash)
+	}()
 
 	cipher, err := kk.GetCipher()
 	if err != nil {

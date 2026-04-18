@@ -1,12 +1,10 @@
 module github.com/mxmauro/keyring
 
-go 1.24.0
-
-toolchain go1.24.2
+go 1.25.3
 
 require (
 	github.com/deneonet/benc v1.1.8
-	github.com/hashicorp/vault v1.19.4
+	github.com/hashicorp/vault v1.21.4
 )
 
-require golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
+require golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect

@@ -12,33 +12,32 @@ import (
 
 // -----------------------------------------------------------------------------
 
-// BeginStorageTransactionFunc defines a function that creates a transaction in the underlying storage.
+// BeginStorageTransactionFunc starts a transaction against the underlying keyring storage.
 type BeginStorageTransactionFunc func(ctx context.Context, readOnly bool) (StorageTx, error)
 
-// StorageTx is an interface that represents a storage transaction.
+// StorageTx represents a storage transaction used by the keyring.
 type StorageTx interface {
-	// Get retrieves the value of the given key. Returns nil and no error if the key is not found.
-	// Also, the implementation must return a copy of the value if the underlying implementation
-	// overwrites its contents.
+	// Get retrieves the value for key and returns nil, nil when the key does not exist.
+	// Implementations must return a copy if the underlying storage can later overwrite the buffer.
 	Get(ctx context.Context, key string) ([]byte, error)
 
-	// Put saves the given value under the provided key. The implementation MUST make a copy of the
-	// value parameter if it needs to keep it until the commit call.
+	// Put stores value under key.
+	// Implementations must copy value if they retain it beyond the call.
 	Put(ctx context.Context, key string, value []byte) error
 
-	// Delete removes the given key from the database. Don't return an error if the key is not found.
+	// Delete removes key from storage and should ignore missing keys.
 	Delete(ctx context.Context, key string) error
 
-	// Commit saves all changes into the storage.
+	// Commit persists the transaction changes.
 	Commit(ctx context.Context) error
 
-	// Rollback discards pending changes.
+	// Rollback discards the transaction changes.
 	Rollback(ctx context.Context)
 }
 
 // -----------------------------------------------------------------------------
 
-// IsKeyringKey returns true if the given key is a keyring key.
+// IsKeyringKey reports whether key belongs to the reserved keyring storage namespace.
 func IsKeyringKey(key string) bool {
 	return isKeyringPath(key)
 }

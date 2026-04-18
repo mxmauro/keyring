@@ -23,7 +23,7 @@ const (
 
 // -----------------------------------------------------------------------------
 
-// Keyring implements a secure store and management of encryption keys.
+// Keyring manages root and encryption keys backed by transactional storage.
 type Keyring struct {
 	rg         io.Reader
 	beginStgTx BeginStorageTransactionFunc
@@ -42,89 +42,88 @@ type Keyring struct {
 	activeEncryptionKeyID uint32
 }
 
-// Options configure the keyring base options.
+// Options configures the dependencies used by a Keyring instance.
 type Options struct {
-	// A transactional-enabled storage that holds keyring data.
+	// BeginStorageTX starts a transaction against the storage that holds keyring data.
 	BeginStorageTX BeginStorageTransactionFunc
 
-	// An optional random number generator reader. If nil, the keyring will use crypto/rand.Reader.
+	// RandomGeneratorReader overrides the randomness source. If nil, crypto/rand.Reader is used.
 	RandomGeneratorReader io.Reader
 }
 
-// InitializeOptions is a set of options to use to initialize the keyring.
+// InitializeOptions configures the initial root key, encryption key, and locking mode.
 type InitializeOptions struct {
 	// Encryption engine to use for the initial encryption key.
 	Engine string
 
-	// Encryption engine to use for the root key. If not defined, the same engine for encryption keys will be used.
+	// RootKeyEngine overrides the root key engine. If empty, Engine is reused.
 	RootKeyEngine string
 
 	ManualLock *ManualLockOptions
 	AutoLock   *AutoLockOptions
 }
 
-// ManualLockOptions defines the keyring manual-lock feature options.
+// ManualLockOptions configures Shamir-based manual unlocking.
 type ManualLockOptions struct {
 	// Threshold defines the minimum number of keys required to unlock the keyring.
 	Threshold int
 
-	// Shares is the number of splits the root key will have.
+	// Shares is the total number of root key shares to generate.
 	Shares int
 }
 
-// AutoLockOptions defines the keyring auto-lock feature options.
+// AutoLockOptions configures external root-key encryption for automatic unlocking.
 type AutoLockOptions struct {
-	// Encrypt function to call when the keyring manager needs to encrypt the root key using the
-	// external secure encryption engine like AWS CloudHSM or Azure Dedicated HSM.
+	// Encrypt encrypts the serialized root key with an external system such as an HSM or KMS.
 	Encrypt func(ctx context.Context, plaintext []byte) ([]byte, error)
 }
 
-// InitializeResult is returned as a result of the keyring initialization process.
+// InitializeResult contains the data returned by Initialize.
 type InitializeResult struct {
 	ManualLock ManualLockResult
 }
 
-// ManualLockResult contains the result of a manual-lock keyring.
+// ManualLockResult contains the manual-unlock material created during initialization or rotation.
 type ManualLockResult struct {
-	// SplitRootKey will hold the split shamir root key.
+	// SplitRootKey contains the generated Shamir root key shares.
 	SplitRootKey [][]byte
 }
 
-// UnlockOptions is a set of options used to unlock the keyring.
+// UnlockOptions selects the mechanism used to unlock the keyring.
 type UnlockOptions struct {
 	ManualUnlock *ManualUnlockOptions
 	AutoUnlock   *AutoUnlockOptions
 }
 
-// ManualUnlockOptions establishes the options to use when manual-locking is used.
+// ManualUnlockOptions provides a root key share for manual unlocking.
 type ManualUnlockOptions struct {
-	// One of the split keys to unlock the keyring.
+	// Key is one of the generated root key shares.
 	Key []byte
 }
 
-// AutoUnlockOptions establishes the options to use when the auto-locking feature is used.
+// AutoUnlockOptions provides access to the external root-key decryption mechanism.
 type AutoUnlockOptions struct {
-	// Function to call when the keyring manager needs to decrypt the root key.
+	// Decrypt decrypts the stored root key ciphertext.
 	Decrypt func(ctx context.Context, ciphertext []byte) ([]byte, error)
 }
 
-// RotateRootKeyOptions is a set of options to use to rotate the root key of the keyring.
+// RotateRootKeyOptions configures a root key rotation and optional locking-mode change.
 type RotateRootKeyOptions struct {
-	// Encryption engine to use for the root key.
+	// Engine selects the encryption engine for the new root key.
 	Engine string
 
 	ManualLock *ManualLockOptions
 	AutoLock   *AutoLockOptions
 }
 
-// RotateRootKeyResult is returned as a result of the root key rotation process.
+// RotateRootKeyResult contains the data returned by RotateRootKey.
 type RotateRootKeyResult struct {
 	ManualLock ManualLockResult
 }
 
 // -----------------------------------------------------------------------------
 
-// New creates a new keyring manager.
+// New creates a Keyring bound to the provided storage and randomness source.
 func New(opts Options) (*Keyring, error) {
 	rg := opts.RandomGeneratorReader
 	if rg == nil {
@@ -147,7 +146,7 @@ func New(opts Options) (*Keyring, error) {
 	return &kr, nil
 }
 
-// Destroy destroys (not physically a keyring). All memory is zeroed.
+// Destroy clears all in-memory state held by the Keyring.
 func (kr *Keyring) Destroy() {
 	kr.mtx.Lock()
 	defer kr.mtx.Unlock()
@@ -157,12 +156,11 @@ func (kr *Keyring) Destroy() {
 	kr.doLock()
 }
 
-// Status returns the current status of the keyring. It can be used to check if the keyring is initialized, unlocked
-// or if another instance using the same database changed any keyring configuration.
+// Status reports whether the unlocked keyring still matches the current storage state.
 //
-// ErrLocked is returned if the keyring is locked.
+// It returns ErrLocked if the keyring is locked.
 //
-// ErrKeyringDataHasChanged is returned if an encryption key was added or the root key or a parameter was changed.
+// It returns ErrKeyringDataHasChanged if another instance changed the stored keyring data.
 func (kr *Keyring) Status(ctx context.Context) error {
 	kr.mtx.RLock()
 	defer kr.mtx.RUnlock()
@@ -182,8 +180,8 @@ func (kr *Keyring) Status(ctx context.Context) error {
 	return err
 }
 
-// Initialize initializes an uninitialized keyring.
-// NOTE: If initialization succeeds, the keyring remains unlocked.
+// Initialize creates the initial root key, encryption key, and stored metadata.
+// On success, the keyring remains unlocked.
 func (kr *Keyring) Initialize(ctx context.Context, opts InitializeOptions) (InitializeResult, error) {
 	var rootKey *keyringKey
 	var encryptedRootKey []byte
@@ -377,7 +375,7 @@ func (kr *Keyring) Initialize(ctx context.Context, opts InitializeOptions) (Init
 	return ret, nil
 }
 
-// Unlock tries to unlock the root key.
+// Unlock reconstructs or decrypts the root key and loads the active encryption keys.
 func (kr *Keyring) Unlock(ctx context.Context, opts UnlockOptions) error {
 	var rootKey *keyringKey
 	var rootKeyNonce []byte
@@ -583,7 +581,7 @@ func (kr *Keyring) Unlock(ctx context.Context, opts UnlockOptions) error {
 	return nil
 }
 
-// CancelUnlock cancels an active keyring unlock process.
+// CancelUnlock discards any partial state accumulated during manual unlock.
 func (kr *Keyring) CancelUnlock() {
 	// Lock access.
 	kr.mtx.Lock()
@@ -593,10 +591,7 @@ func (kr *Keyring) CancelUnlock() {
 	kr.doCancelUnlock()
 }
 
-// Lock locks access until unlocked again.
-// NOTE: If you lock an auto-unlock keyring, you will need to create a new keyring object based on the same
-//
-//	storage and auto-unlock interface to unlock it.
+// Lock clears the in-memory root and encryption keys until Unlock is called again.
 func (kr *Keyring) Lock() {
 	// Lock access
 	kr.mtx.Lock()
@@ -631,7 +626,7 @@ func (kr *Keyring) doCancelUnlock() {
 	kr.unlockInProgress.keys = nil
 }
 
-// IsLocked returns if the keyring is locked or not.
+// IsLocked reports whether the keyring currently has its root key loaded in memory.
 func (kr *Keyring) IsLocked() bool {
 	// Lock access.
 	kr.mtx.RLock()
@@ -641,7 +636,7 @@ func (kr *Keyring) IsLocked() bool {
 	return !kr.isUnlocked()
 }
 
-// RotateRootKey changes the root key. It also allows changing from manual to auto-locking and vice versa.
+// RotateRootKey replaces the root key and can also switch between manual and automatic unlocking.
 func (kr *Keyring) RotateRootKey(ctx context.Context, opts RotateRootKeyOptions) (RotateRootKeyResult, error) {
 	var newRootKey *keyringKey
 	var newRootKeyNonce []byte
@@ -815,7 +810,7 @@ func (kr *Keyring) RotateRootKey(ctx context.Context, opts RotateRootKeyOptions)
 	return ret, nil
 }
 
-// AddEncryptionKey adds a new encryption key to the keyring. Later encryption will use this new key.
+// AddEncryptionKey creates a new active encryption key for future Encrypt calls.
 func (kr *Keyring) AddEncryptionKey(ctx context.Context, engine string) error {
 	var newEncryptionKeyID uint32
 	var err error
@@ -873,7 +868,7 @@ func (kr *Keyring) AddEncryptionKey(ctx context.Context, engine string) error {
 	return nil
 }
 
-// Encrypt encrypts the given plain text with the current active encryption key.
+// Encrypt encrypts plaintext with the current active encryption key.
 func (kr *Keyring) Encrypt(plaintext []byte) ([]byte, error) {
 	var ciphertext []byte
 
@@ -913,7 +908,7 @@ func (kr *Keyring) Encrypt(plaintext []byte) ([]byte, error) {
 	return ret, nil
 }
 
-// Decrypt decrypts the given cipher text with the available encryption keys.
+// Decrypt decrypts ciphertext with the matching stored encryption key.
 func (kr *Keyring) Decrypt(ciphertext []byte) ([]byte, error) {
 	var plaintext []byte
 

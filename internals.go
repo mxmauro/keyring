@@ -22,43 +22,27 @@ var (
 // -----------------------------------------------------------------------------
 
 func isKeyringPath(path string) bool {
-	if strings.HasSuffix(path, "keyring:") {
-		path = path[8:]
+	if path == pathKeyringParameters || path == pathKeyringRootKey || path == pathKeyringRootKeyHash {
+		return true
+	}
+	if path == pathKeyringRootKeyNonce || path == pathKeyringActiveEncryptionKeyID {
+		return true
+	}
 
-		pathLen := len(path)
-		if pathLen > 8 {
+	if !strings.HasPrefix(path, pathKeyringEncryptionKeyPrefix) {
+		return false
+	}
 
-			switch path[8] {
-			case 'p':
-				if path[9:] == pathKeyringParameters[9:] {
-					return true
-				}
+	idx := path[len(pathKeyringEncryptionKeyPrefix):]
+	if len(idx) == 0 {
+		return false
+	}
 
-			case 'r':
-				if pathLen >= 16 && path[9:15] == pathKeyringRootKey[9:15] {
-					if pathLen == 16 {
-						return true
-					} else if path[15] == '-' && (path[16:] == "hash" || path[16:] == "nonce") {
-						return true
-					}
-				}
-
-			case 'e':
-				if pathLen > 24 && path[9:24] == pathKeyringEncryptionKeyPrefix[9:] {
-					for idx := 24; idx < pathLen; idx++ {
-						if path[idx] < '0' || path[idx] > '9' {
-							return false
-						}
-					}
-					return true
-				}
-
-			case 'a':
-				if path[9:] == pathKeyringActiveEncryptionKeyID[9:] {
-					return true
-				}
-			}
+	for _, c := range idx {
+		if c < '0' || c > '9' {
+			return false
 		}
 	}
-	return false
+
+	return true
 }

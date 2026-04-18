@@ -32,7 +32,7 @@ type aesGcmCipher struct {
 
 // -----------------------------------------------------------------------------
 
-// GenerateKey generates a new AES-GCM key.
+// GenerateKey creates a new 256-bit AES-GCM key.
 func GenerateKey(r io.Reader) ([]byte, error) {
 	// Generate a 256bit key.
 	key := make([]byte, aesKeyLen)
@@ -49,7 +49,7 @@ func GenerateKey(r io.Reader) ([]byte, error) {
 	return key, nil
 }
 
-// NewFromKey creates a new AES-GCM cipher object from the given key.
+// NewFromKey creates an AES-GCM cipher from key.
 func NewFromKey(key []byte, r io.Reader) (models.Cipher, error) {
 	var aead cipher.AEAD
 
@@ -85,12 +85,12 @@ func NewFromKey(key []byte, r io.Reader) (models.Cipher, error) {
 	return c, nil
 }
 
-// KeyLen returns the length of the key used by the AES-GCM cipher.
+// KeyLen returns the AES-GCM key length in bytes.
 func (c *aesGcmCipher) KeyLen() int {
 	return aesKeyLen
 }
 
-// Encrypt encrypts the given plaintext using the AES-GCM cipher.
+// Encrypt encrypts plaintext and prefixes the nonce metadata required for decryption.
 func (c *aesGcmCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	// Generate a random nonce.
 	nonce := c.noncePool.Get().([]byte)
@@ -117,7 +117,7 @@ func (c *aesGcmCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	return ciphertext, nil
 }
 
-// Decrypt decrypts the given ciphertext using the AES-GCM cipher.
+// Decrypt validates the nonce metadata and decrypts ciphertext.
 func (c *aesGcmCipher) Decrypt(ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) <= 2+c.nonceSize {
 		return nil, errors.New("empty or invalid ciphertext")

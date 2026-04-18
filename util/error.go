@@ -14,7 +14,7 @@ type extendedError struct {
 
 // -----------------------------------------------------------------------------
 
-// NewExtendedError creates a new error that wraps an error and includes the given message.
+// NewExtendedError wraps err with an additional message.
 func NewExtendedError(err error, message string) error {
 	return &extendedError{
 		message: message,
@@ -22,7 +22,7 @@ func NewExtendedError(err error, message string) error {
 	}
 }
 
-// Error returns a string representation of the error.
+// Error formats the wrapped error chain as a single string.
 func (w *extendedError) Error() string {
 	sb := strings.Builder{}
 	_, _ = sb.WriteString(w.message)
@@ -42,7 +42,7 @@ func (w *extendedError) Error() string {
 	return sb.String()
 }
 
-// Unwrap returns the underlying error.
+// Unwrap returns the wrapped error.
 func (w *extendedError) Unwrap() error {
 	return w.err
 }

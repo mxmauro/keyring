@@ -12,10 +12,12 @@ import (
 
 // -----------------------------------------------------------------------------
 
+// TestStorage is an in-memory storage backend used by the tests.
 type TestStorage struct {
 	kv map[string][]byte
 }
 
+// TestStorageTx is a transactional view over TestStorage used by the tests.
 type TestStorageTx struct {
 	stg       *TestStorage
 	readOnly  bool
@@ -30,6 +32,7 @@ func newTestStorage() *TestStorage {
 	}
 }
 
+// BeginTX starts a new in-memory transaction for tests.
 func (stg *TestStorage) BeginTX(_ context.Context, readOnly bool) (keyring.StorageTx, error) {
 	tx := TestStorageTx{
 		stg:       stg,
@@ -39,6 +42,7 @@ func (stg *TestStorage) BeginTX(_ context.Context, readOnly bool) (keyring.Stora
 	return &tx, nil
 }
 
+// Dump writes the current storage contents to the test log.
 func (stg *TestStorage) Dump(t *testing.T) {
 	t.Log("Storage dump:")
 	for k, v := range stg.kv {
@@ -46,6 +50,7 @@ func (stg *TestStorage) Dump(t *testing.T) {
 	}
 }
 
+// Commit applies the pending transaction changes to the backing storage.
 func (tx *TestStorageTx) Commit(_ context.Context) error {
 	for k, v := range tx.kvChanges {
 		if v != nil {
@@ -57,9 +62,11 @@ func (tx *TestStorageTx) Commit(_ context.Context) error {
 	return nil
 }
 
+// Rollback discards the pending transaction changes.
 func (tx *TestStorageTx) Rollback(_ context.Context) {
 }
 
+// Get returns a copy of the stored value for key.
 func (tx *TestStorageTx) Get(_ context.Context, key string) ([]byte, error) {
 	value, ok := tx.kvChanges[key]
 	if !ok {
@@ -68,11 +75,12 @@ func (tx *TestStorageTx) Get(_ context.Context, key string) ([]byte, error) {
 	if ok {
 		valueCopy := make([]byte, len(value))
 		copy(valueCopy, value)
-		return value, nil
+		return valueCopy, nil
 	}
 	return nil, nil
 }
 
+// Put stores a copy of value in the transaction.
 func (tx *TestStorageTx) Put(_ context.Context, key string, value []byte) error {
 	if tx.readOnly {
 		return errors.New("read only transaction")
@@ -83,6 +91,7 @@ func (tx *TestStorageTx) Put(_ context.Context, key string, value []byte) error 
 	return nil
 }
 
+// Delete marks key for removal when the transaction commits.
 func (tx *TestStorageTx) Delete(_ context.Context, key string) error {
 	tx.kvChanges[key] = nil
 	return nil
