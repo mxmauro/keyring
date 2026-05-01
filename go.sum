@@ -1,6 +1,4 @@
-github.com/deneonet/benc v1.1.8 h1:Qk9diyH0UcnduvCrZ62mBrwUeSZzte4kQxMbclVdhW4=
-github.com/deneonet/benc v1.1.8/go.mod h1:UCfkM5Od0B2huwv/ZItvtUb7QnALFt9YXtX8NXX4Lts=
 github.com/hashicorp/vault v1.21.4 h1:KHGcdSnJtombvae1gDk+jZ50kiFngJPFDOvcCJRnU0c=
 github.com/hashicorp/vault v1.21.4/go.mod h1:KTaqpox1LUSI3vqfpCXO477nPEPOyLVan8JujzoIMvA=
-golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 h1:mgKeJMpvi0yx/sU5GsxQ7p6s2wtOnGAHZWCHUM4KGzY=
-golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546/go.mod h1:j/pmGrbnkbPtQfxEe5D0VQhZC6qKbfKifgD0oM7sR70=
+github.com/mxmauro/bencstd-compat v0.1.0 h1:Wdmu9yEV62F7SahQWwDlaNxOE2HIbr4IFhqxfHog38w=
+github.com/mxmauro/bencstd-compat v0.1.0/go.mod h1:hLzYfTQO7B31WLw/PYbaIoMkIFE8GM3aCAy1JXi1OYU=

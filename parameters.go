@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	bstd "github.com/deneonet/benc/std"
+	bstd "github.com/mxmauro/bencstd-compat"
 )
 
 // -----------------------------------------------------------------------------
@@ -26,49 +26,33 @@ type keyringParameters struct {
 // -----------------------------------------------------------------------------
 
 func deserializeKeyringParameters(buf []byte) (keyringParameters, error) {
-	bufSize := len(buf)
-	if bufSize <= bstd.SizeUint16() {
-		return keyringParameters{}, ErrInvalidStoredData
-	}
-
 	// Initialize parameters.
 	kp := keyringParameters{}
 
 	// Deserialize data.
-	ofs, version, err := bstd.UnmarshalUint16(0, buf)
-	if err != nil {
+	if len(buf) < 2 {
 		return keyringParameters{}, ErrInvalidStoredData
 	}
+
+	dec := bstd.NewDecoder(buf)
+	version := dec.Uint16()
+	if dec.Err() != nil {
+		return keyringParameters{}, ErrInvalidStoredData
+	}
+
 	switch version {
 	case 1:
-		ofs, kp.uniqueID, err = bstd.UnmarshalUint64(ofs, buf)
-		if err != nil {
-			return keyringParameters{}, ErrInvalidStoredData
-		}
-		ofs, kp.revision, err = bstd.UnmarshalUint32(ofs, buf)
-		if err != nil {
-			return keyringParameters{}, ErrInvalidStoredData
-		}
-		ofs, kp.usingAutoUnlock, err = bstd.UnmarshalBool(ofs, buf)
-		if err != nil {
-			return keyringParameters{}, ErrInvalidStoredData
-		}
-		ofs, kp.shares, err = bstd.UnmarshalByte(ofs, buf)
-		if err != nil {
-			return keyringParameters{}, ErrInvalidStoredData
-		}
-		ofs, kp.threshold, err = bstd.UnmarshalByte(ofs, buf)
-		if err != nil {
+		kp.uniqueID = dec.Uint64()
+		kp.revision = dec.Uint32()
+		kp.usingAutoUnlock = dec.Bool()
+		kp.shares = dec.Byte()
+		kp.threshold = dec.Byte()
+		if dec.Err() != nil || dec.Remaining() != 0 {
 			return keyringParameters{}, ErrInvalidStoredData
 		}
 
 	default:
 		return keyringParameters{}, errors.New("unsupported keyring parameters version")
-	}
-
-	// Check if we reached the end of the buffer.
-	if ofs != len(buf) {
-		return keyringParameters{}, ErrInvalidStoredData
 	}
 
 	// Done
@@ -98,23 +82,20 @@ func deserializeKeyringParametersFromStorage(ctx context.Context, tx StorageTx, 
 }
 
 func (kp *keyringParameters) Serialize() []byte {
-	bufSize := bstd.SizeUint16() +
-		bstd.SizeUint64() +
-		bstd.SizeUint32() +
-		bstd.SizeBool() +
-		bstd.SizeByte() +
-		bstd.SizeByte()
-	buf := make([]byte, bufSize)
+	enc := bstd.NewDynamicEncoder(32)
 
-	ofs := bstd.MarshalUint16(0, buf, keyringParametersVersion)
-	ofs = bstd.MarshalUint64(ofs, buf, kp.uniqueID)
-	ofs = bstd.MarshalUint32(ofs, buf, kp.revision)
-	ofs = bstd.MarshalBool(ofs, buf, kp.usingAutoUnlock)
-	ofs = bstd.MarshalByte(ofs, buf, kp.shares)
-	ofs = bstd.MarshalByte(ofs, buf, kp.threshold)
+	enc.Uint16(keyringParametersVersion)
+	enc.Uint64(kp.uniqueID)
+	enc.Uint32(kp.revision)
+	enc.Bool(kp.usingAutoUnlock)
+	enc.Byte(kp.shares)
+	enc.Byte(kp.threshold)
+	if enc.Err() != nil {
+		return nil
+	}
 
 	// Done
-	return buf
+	return enc.Bytes()
 }
 
 func (kp *keyringParameters) SerializeToStorage(ctx context.Context, tx StorageTx, key string) error {

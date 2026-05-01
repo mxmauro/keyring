@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	bstd "github.com/deneonet/benc/std"
 	"github.com/hashicorp/vault/shamir"
+	bstd "github.com/mxmauro/bencstd-compat"
 	"github.com/mxmauro/keyring/crypto/ciphers"
 	"github.com/mxmauro/keyring/models"
 	"github.com/mxmauro/keyring/util"
@@ -73,13 +73,6 @@ func generateKeyringKey(engine string, rg io.Reader) (*keyringKey, error) {
 }
 
 func deserializeKeyringKey(buf []byte, rg io.Reader) (*keyringKey, error) {
-	var ct int64
-
-	bufSize := len(buf)
-	if bufSize <= bstd.SizeUint16() {
-		return nil, ErrInvalidStoredData
-	}
-
 	// Initialize key.
 	kk := keyringKey{
 		rg: rg,
@@ -93,37 +86,27 @@ func deserializeKeyringKey(buf []byte, rg io.Reader) (*keyringKey, error) {
 	}()
 
 	// Deserialize data.
-	ofs, version, err := bstd.UnmarshalUint16(0, buf)
-	if err != nil {
+	dec := bstd.NewDecoder(buf)
+	version := dec.Uint16()
+	if dec.Err() != nil {
 		return nil, ErrInvalidStoredData
 	}
+
 	switch version {
 	case 1:
-		ofs, kk.ID, err = bstd.UnmarshalUint32(ofs, buf)
-		if err != nil {
+		kk.ID = dec.Uint32()
+		kk.Engine = dec.String()
+		kk.Key = dec.BytesCopied()
+		kk.CreationTime = time.Unix(dec.Int64(), 0).UTC()
+		if dec.Err() != nil || dec.Remaining() != 0 || len(kk.Engine) == 0 || len(kk.Key) == 0 {
 			return nil, ErrInvalidStoredData
 		}
-		ofs, kk.Engine, err = bstd.UnmarshalString(ofs, buf)
-		if err != nil {
-			return nil, ErrInvalidStoredData
-		}
-		ofs, kk.Key, err = bstd.UnmarshalBytesCopied(ofs, buf)
-		if err != nil {
-			return nil, ErrInvalidStoredData
-		}
-		ofs, ct, err = bstd.UnmarshalInt64(ofs, buf)
-		kk.CreationTime = time.Unix(ct, 0).UTC()
 
 	default:
 		return nil, errors.New("unsupported keyring key version")
 	}
 
-	// Check if we reached the end of the buffer.
-	if ofs != len(buf) {
-		return nil, ErrInvalidStoredData
-	}
-
-	// CHeck if the engine is supported.
+	// Check if the engine is supported.
 	if !ciphers.IsEngineSupported(kk.Engine) {
 		return nil, ciphers.ErrEngineNotSupported
 	}
@@ -147,17 +130,19 @@ func (kk *keyringKey) Zeroize() {
 }
 
 func (kk *keyringKey) Serialize() []byte {
-	bufSize := bstd.SizeUint16() + bstd.SizeString(kk.Engine) + bstd.SizeUint32() + bstd.SizeBytes(kk.Key) + bstd.SizeUint64()
-	buf := make([]byte, bufSize)
+	enc := bstd.NewDynamicEncoder(64)
 
-	ofs := bstd.MarshalUint16(0, buf, keyringKeyVersion)
-	ofs = bstd.MarshalUint32(ofs, buf, kk.ID)
-	ofs = bstd.MarshalString(ofs, buf, kk.Engine)
-	ofs = bstd.MarshalBytes(ofs, buf, kk.Key)
-	ofs = bstd.MarshalInt64(ofs, buf, kk.CreationTime.Unix())
+	enc.Uint16(keyringKeyVersion)
+	enc.Uint32(kk.ID)
+	enc.String(kk.Engine)
+	enc.BytesValue(kk.Key)
+	enc.Int64(kk.CreationTime.Unix())
+	if enc.Err() != nil {
+		return nil
+	}
 
 	// Done
-	return buf
+	return enc.Bytes()
 }
 
 func (kk *keyringKey) SerializeToStorage(ctx context.Context, tx StorageTx, key string) error {
